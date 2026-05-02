@@ -5,6 +5,9 @@ NSO GameCube Controller Driver - Based on Discovered Protocol
 Uses the initialization sequence and HID format discovered by the community.
 """
 
+import ctypes.util
+import os
+import usb.backend.libusb1
 import usb.core
 import usb.util
 import hid
@@ -14,6 +17,64 @@ import threading
 import asyncio
 import queue
 from collections import deque
+
+_USB_BACKEND = None
+_USB_BACKEND_INITIALIZED = False
+
+
+def _get_bundle_libusb_candidates():
+    if not getattr(sys, "frozen", False):
+        return []
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    bundle_dir = os.path.normpath(os.path.join(exe_dir, ".."))
+    candidates = []
+    for base_dir in (
+        os.path.join(bundle_dir, "Frameworks"),
+        os.path.join(bundle_dir, "Resources"),
+    ):
+        for name in (
+            "libusb-1.0.0.dylib",
+            "libusb-1.0.dylib",
+            "libusb-1.0.so.0",
+            "libusb-1.0.so",
+        ):
+            path = os.path.join(base_dir, name)
+            if os.path.isfile(path):
+                candidates.append(path)
+    return candidates
+
+
+def _find_libusb_library(candidate):
+    candidate_names = {
+        "libusb-1.0.0.dylib",
+        "libusb-1.0.dylib",
+        "libusb-1.0.so.0",
+        "libusb-1.0.so",
+        candidate,
+        f"{candidate}.dylib",
+        f"{candidate}.so",
+        f"{candidate}.so.0",
+    }
+    if not candidate.startswith("lib"):
+        candidate_names.update({
+            f"lib{candidate}.dylib",
+            f"lib{candidate}.so",
+            f"lib{candidate}.so.0",
+        })
+
+    for path in _get_bundle_libusb_candidates():
+        if os.path.basename(path) in candidate_names:
+            return path
+
+    return ctypes.util.find_library(candidate)
+
+
+def get_usb_backend():
+    global _USB_BACKEND, _USB_BACKEND_INITIALIZED
+    if not _USB_BACKEND_INITIALIZED:
+        _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
+        _USB_BACKEND_INITIALIZED = True
+    return _USB_BACKEND
 
 # Optional BLE support (for wireless controller not visible as HID)
 try:
@@ -209,7 +270,7 @@ class NSODriver:
 
     def find_usb_device(self, device_index: int = 0):
         """Find USB device and get endpoints. device_index=0 for first, 1 for second, etc."""
-        devices = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+        devices = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID, backend=get_usb_backend()))
         if device_index >= len(devices):
             return False
         self.usb_device = devices[device_index]
@@ -1614,7 +1675,7 @@ class NSOWirelessDriver(NSODriver):
 def count_usb_controllers() -> int:
     """Return number of NSO USB controllers connected."""
     try:
-        return len(list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID)))
+        return len(list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID, backend=get_usb_backend())))
     except Exception:
         return 0
 

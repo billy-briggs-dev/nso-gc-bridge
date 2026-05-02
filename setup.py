@@ -10,6 +10,7 @@ The plist (CFBundleVersion, NSHumanReadableCopyright) controls the About dialog.
 Edit COPYRIGHT in this file to set the copyright string.
 """
 
+import ctypes.util
 import os
 from setuptools import setup
 
@@ -58,6 +59,50 @@ def _find_tcl_tk_resources():
         return resources
 
 
+def _find_libusb_binaries():
+    """Find libusb shared libraries so py2app can bundle them into the app."""
+    candidates = []
+    search_dirs = [
+        "/opt/homebrew/opt/libusb/lib",
+        "/usr/local/opt/libusb/lib",
+        "/opt/local/lib",
+        "/opt/homebrew/lib",
+        "/usr/local/lib",
+        "/usr/lib",
+        "/lib",
+    ]
+    known_names = [
+        "libusb-1.0.0.dylib",
+        "libusb-1.0.dylib",
+        "libusb-1.0.so.0",
+        "libusb-1.0.so",
+    ]
+
+    for directory in search_dirs:
+        for name in known_names:
+            candidates.append(os.path.join(directory, name))
+
+    for lib_name in ("usb-1.0", "libusb-1.0", "usb"):
+        found = ctypes.util.find_library(lib_name)
+        if not found:
+            continue
+        if os.path.isabs(found):
+            candidates.append(found)
+            continue
+        for directory in search_dirs:
+            candidates.append(os.path.join(directory, found))
+
+    binaries = []
+    seen = set()
+    for candidate in candidates:
+        real_path = os.path.realpath(candidate)
+        if real_path in seen or not os.path.isfile(real_path):
+            continue
+        seen.add(real_path)
+        binaries.append(real_path)
+    return binaries
+
+
 OPTIONS = {
     "py2app": {
         "argv_emulation": False,  # Don't use with GUI toolkits
@@ -66,7 +111,7 @@ OPTIONS = {
         "packages": ["usb", "bleak", "tkinter"],  # Python packages
         "includes": ["tkinter", "hid"],  # hid is C extension (.so); include so it goes to lib-dynload
         "excludes": ["test", "unittest"],  # Exclude stdlib test suite (reduces size, avoids copy issues)
-        "frameworks": _find_tcl_tk_frameworks(),  # Bundle Tcl/Tk frameworks
+        "frameworks": _find_tcl_tk_frameworks() + _find_libusb_binaries(),  # Bundle Tcl/Tk and libusb
         "plist": {
             "CFBundleName": "NSO GC Bridge",
             "CFBundleDisplayName": "NSO GameCube Controller Bridge",
