@@ -5,15 +5,152 @@ NSO GameCube Controller Driver - Based on Discovered Protocol
 Uses the initialization sequence and HID format discovered by the community.
 """
 
-import usb.core
-import usb.util
-import hid
-import time
+import ctypes.util
+import os
 import sys
+import time
 import threading
 import asyncio
 import queue
 from collections import deque
+
+
+def _bootstrap_app_python_paths():
+    """Use bundled app libraries when running via Contents/MacOS/python main.py."""
+    if getattr(sys, "frozen", False):
+        return
+
+    source_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(source_dir) != "Resources":
+        return
+
+    contents_dir = os.path.dirname(source_dir)
+    if os.path.basename(contents_dir) != "Contents":
+        return
+
+    lib_dir = os.path.join(source_dir, "lib")
+    versioned_lib_dir = os.path.join(lib_dir, f"python{sys.version_info.major}.{sys.version_info.minor}")
+    dynload_dir = os.path.join(versioned_lib_dir, "lib-dynload")
+    zip_path = os.path.join(lib_dir, f"python{sys.version_info.major}{sys.version_info.minor}.zip")
+
+    for path in (dynload_dir, versioned_lib_dir, zip_path, source_dir):
+        if os.path.exists(path) and path not in sys.path:
+            sys.path.insert(0, path)
+
+
+_bootstrap_app_python_paths()
+
+import usb.backend.libusb1
+import usb.core
+import usb.util
+import hid
+
+_USB_BACKEND = None
+_USB_BACKEND_INITIALIZED = False
+_USB_BACKEND_LOCK = threading.Lock()
+
+
+def _get_packaged_libusb_candidates(candidate_names=None):
+    if candidate_names is None:
+        candidate_names = {
+            "libusb-1.0.0.dylib",
+            "libusb-1.0.dylib",
+            "libusb-1.0.so.0",
+            "libusb-1.0.so",
+        }
+    try:
+        import libusb_package
+
+        package_dir = os.path.dirname(os.path.abspath(libusb_package.__file__))
+    except Exception:
+        return []
+
+    candidates = []
+    seen = set()
+    for name in candidate_names:
+        path = os.path.join(package_dir, name)
+        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+            continue
+        real_path = os.path.realpath(path)
+        if real_path in seen:
+            continue
+        seen.add(real_path)
+        candidates.append(real_path)
+    return candidates
+
+
+def _libusb_candidate_names(library_name):
+    names = set()
+    base_names = {library_name, "usb-1.0", "libusb-1.0"}
+    prefixed_base_names = {f"lib{base_name}" for base_name in base_names if not base_name.startswith("lib")}
+
+    for base_name in base_names | prefixed_base_names:
+        names.add(base_name)
+        for suffix in (".dylib", ".0.dylib", ".so", ".so.0"):
+            names.add(f"{base_name}{suffix}")
+    return names
+
+
+def _get_bundle_libusb_candidates(candidate_names=None):
+    if candidate_names is None:
+        candidate_names = {
+            "libusb-1.0.0.dylib",
+            "libusb-1.0.dylib",
+            "libusb-1.0.so.0",
+            "libusb-1.0.so",
+        }
+    bundle_dirs = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        bundle_dirs.append(os.path.normpath(os.path.join(exe_dir, "..")))
+    else:
+        source_dir = os.path.dirname(os.path.abspath(__file__))
+        if os.path.basename(source_dir) == "Resources":
+            contents_dir = os.path.dirname(source_dir)
+            if os.path.basename(contents_dir) == "Contents":
+                bundle_dirs.append(contents_dir)
+
+    candidates = []
+    seen = set()
+    for bundle_dir in bundle_dirs:
+        for base_dir in (
+            os.path.join(bundle_dir, "Frameworks"),
+            os.path.join(bundle_dir, "Resources"),
+        ):
+            for name in candidate_names:
+                path = os.path.join(base_dir, name)
+                if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                    continue
+                real_path = os.path.realpath(path)
+                if real_path in seen:
+                    continue
+                seen.add(real_path)
+                candidates.append(real_path)
+    return candidates
+
+
+def _find_libusb_library(library_name):
+    """Resolve libusb, preferring a readable bundled copy in frozen app builds."""
+    candidate_names = _libusb_candidate_names(library_name)
+    packaged_candidates = _get_packaged_libusb_candidates(candidate_names)
+    if packaged_candidates:
+        return packaged_candidates[0]
+
+    bundled_candidates = _get_bundle_libusb_candidates(candidate_names)
+    if bundled_candidates:
+        return bundled_candidates[0]
+
+    return ctypes.util.find_library(library_name)
+
+
+def get_usb_backend():
+    """Return the cached libusb backend used for USB controller discovery."""
+    global _USB_BACKEND, _USB_BACKEND_INITIALIZED
+    with _USB_BACKEND_LOCK:
+        if not _USB_BACKEND_INITIALIZED:
+            _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
+            _USB_BACKEND_INITIALIZED = True
+        return _USB_BACKEND
 
 # Optional BLE support (for wireless controller not visible as HID)
 try:
@@ -209,7 +346,7 @@ class NSODriver:
 
     def find_usb_device(self, device_index: int = 0):
         """Find USB device and get endpoints. device_index=0 for first, 1 for second, etc."""
-        devices = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+        devices = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID, backend=get_usb_backend()))
         if device_index >= len(devices):
             return False
         self.usb_device = devices[device_index]
@@ -1614,7 +1751,7 @@ class NSOWirelessDriver(NSODriver):
 def count_usb_controllers() -> int:
     """Return number of NSO USB controllers connected."""
     try:
-        return len(list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID)))
+        return len(list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID, backend=get_usb_backend())))
     except Exception:
         return 0
 
