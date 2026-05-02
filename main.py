@@ -22,6 +22,26 @@ _USB_BACKEND = None
 _USB_BACKEND_INITIALIZED = False
 
 
+def _libusb_candidate_names(candidate):
+    names = {
+        "libusb-1.0.0.dylib",
+        "libusb-1.0.dylib",
+        "libusb-1.0.so.0",
+        "libusb-1.0.so",
+        candidate,
+        f"{candidate}.dylib",
+        f"{candidate}.so",
+        f"{candidate}.so.0",
+    }
+    if not candidate.startswith("lib"):
+        names.update({
+            f"lib{candidate}.dylib",
+            f"lib{candidate}.so",
+            f"lib{candidate}.so.0",
+        })
+    return names
+
+
 def _get_bundle_libusb_candidates():
     if not getattr(sys, "frozen", False):
         return []
@@ -45,23 +65,7 @@ def _get_bundle_libusb_candidates():
 
 
 def _find_libusb_library(candidate):
-    candidate_names = {
-        "libusb-1.0.0.dylib",
-        "libusb-1.0.dylib",
-        "libusb-1.0.so.0",
-        "libusb-1.0.so",
-        candidate,
-        f"{candidate}.dylib",
-        f"{candidate}.so",
-        f"{candidate}.so.0",
-    }
-    if not candidate.startswith("lib"):
-        candidate_names.update({
-            f"lib{candidate}.dylib",
-            f"lib{candidate}.so",
-            f"lib{candidate}.so.0",
-        })
-
+    candidate_names = _libusb_candidate_names(candidate)
     for path in _get_bundle_libusb_candidates():
         if os.path.basename(path) in candidate_names:
             return path
