@@ -1,0 +1,55 @@
+{
+  "description": "Neutral USB report using the current USB parser offsets.",
+  "parser": "NSODriver.parse_input",
+  "raw_report": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    8,
+    128,
+    0,
+    8,
+    128,
+    0,
+    0,
+    0,
+    0
+  ],
+  "raw_report_hex": "00 00 00 00 00 00 00 08 80 00 08 80 00 00 00 00",
+  "expected": {
+    "pressed_buttons": [],
+    "buttons": {
+      "A": false,
+      "B": false,
+      "X": false,
+      "Y": false,
+      "L": false,
+      "R": false,
+      "Z": false,
+      "ZL": false,
+      "Start": false,
+      "Home": false,
+      "Capture": false,
+      "Dpad_Up": false,
+      "Dpad_Down": false,
+      "Dpad_Left": false,
+      "Dpad_Right": false
+    },
+    "trigger_l": 0,
+    "trigger_r": 0,
+    "sticks": {
+      "main_x": 0,
+      "main_y": 0,
+      "c_x": 0,
+      "c_y": 0,
+      "main_x_raw": 2048,
+      "main_y_raw": 2048,
+      "c_x_raw": 2048,
+      "c_y_raw": 2048
+    }
+  }
+}

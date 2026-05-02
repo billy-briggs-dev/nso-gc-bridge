@@ -1,0 +1,102 @@
+{
+  "description": "USB trigger fixtures anchored to bytes 13 and 14 in the current parser.",
+  "parser": "NSODriver.parse_input",
+  "cases": [
+    {
+      "name": "neutral",
+      "raw_report": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        8,
+        128,
+        0,
+        8,
+        128,
+        0,
+        0,
+        0,
+        0
+      ],
+      "raw_report_hex": "00 00 00 00 00 00 00 08 80 00 08 80 00 00 00 00",
+      "expected_trigger_l": 0,
+      "expected_trigger_r": 0
+    },
+    {
+      "name": "l_half",
+      "raw_report": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        8,
+        128,
+        0,
+        8,
+        128,
+        0,
+        128,
+        0,
+        0
+      ],
+      "raw_report_hex": "00 00 00 00 00 00 00 08 80 00 08 80 00 80 00 00",
+      "expected_trigger_l": 128,
+      "expected_trigger_r": 0
+    },
+    {
+      "name": "r_half",
+      "raw_report": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        8,
+        128,
+        0,
+        8,
+        128,
+        0,
+        0,
+        128,
+        0
+      ],
+      "raw_report_hex": "00 00 00 00 00 00 00 08 80 00 08 80 00 00 80 00",
+      "expected_trigger_l": 0,
+      "expected_trigger_r": 128
+    },
+    {
+      "name": "both_full",
+      "raw_report": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        8,
+        128,
+        0,
+        8,
+        128,
+        0,
+        255,
+        255,
+        0
+      ],
+      "raw_report_hex": "00 00 00 00 00 00 00 08 80 00 08 80 00 ff ff 00",
+      "expected_trigger_l": 255,
+      "expected_trigger_r": 255
+    }
+  ]
+}

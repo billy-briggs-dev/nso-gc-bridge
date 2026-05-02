@@ -1,0 +1,51 @@
+{
+  "description": "Neutral BLE 0x3F report using 16-bit centered stick values.",
+  "parser": "NSOWirelessDriver.parse_ble_input (ble_report_layout=0x3f)",
+  "raw_report": [
+    63,
+    0,
+    0,
+    0,
+    0,
+    128,
+    0,
+    128,
+    0,
+    128,
+    0,
+    128
+  ],
+  "raw_report_hex": "3f 00 00 00 00 80 00 80 00 80 00 80",
+  "expected": {
+    "pressed_buttons": [],
+    "buttons": {
+      "A": false,
+      "B": false,
+      "X": false,
+      "Y": false,
+      "L": false,
+      "R": false,
+      "Z": false,
+      "ZL": false,
+      "Start": false,
+      "Home": false,
+      "Capture": false,
+      "Dpad_Up": false,
+      "Dpad_Down": false,
+      "Dpad_Left": false,
+      "Dpad_Right": false
+    },
+    "trigger_l": 0,
+    "trigger_r": 0,
+    "sticks": {
+      "main_x": 0,
+      "main_y": 0,
+      "c_x": 0,
+      "c_y": 0,
+      "main_x_raw": 32768,
+      "main_y_raw": 32768,
+      "c_x_raw": 32768,
+      "c_y_raw": 32768
+    }
+  }
+}

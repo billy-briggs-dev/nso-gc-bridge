@@ -45,6 +45,16 @@ import usb.core
 import usb.util
 import hid
 
+from core import (
+    CalibrationState,
+    ControllerState,
+    NSOReportParser,
+    build_input_mode,
+    build_rumble,
+    build_set_player_led,
+    extract_calibration_sample,
+)
+
 _USB_BACKEND = None
 _USB_BACKEND_INITIALIZED = False
 _USB_BACKEND_LOCK = threading.Lock()
@@ -241,45 +251,28 @@ DEFAULT_REPORT_DATA = [
     0x00, 0x00, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 ]
 
-# Player indicator LED masks (per NSO-GameCube-Controller-Pairing-App / BlueRetro protocol)
-# Player 1=0x01, 2=0x03, 3=0x05, 4=0x06
-LED_MAP = [0x01, 0x03, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x0B]
-
-
 def build_led_data_usb(slot_index: int) -> bytes:
     """Build LED command for USB (interface 0x00). Slot 0-3 = Player 1-4."""
-    led_mask = LED_MAP[min(slot_index, len(LED_MAP) - 1)]
-    return bytes([
-        0x09, 0x91, 0x00, 0x07, 0x00, 0x08,
-        0x00, 0x00, led_mask, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    ])
+    return build_set_player_led(slot_index, "usb")
 
 
 def build_led_cmd_ble(slot_index: int) -> bytes:
     """Build LED command for BLE (interface 0x01). Must be sent to command channel (0x0014), not handshake char."""
-    led_mask = LED_MAP[min(slot_index, len(LED_MAP) - 1)]
-    return bytes([
-        0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00,
-        led_mask, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ])
+    return build_set_player_led(slot_index, "ble")
 
 
 # Legacy: single controller default (player 1)
 SET_LED_DATA = build_led_data_usb(0)
 
 # Subcommand 0x03: Set Input Mode — 0x30 = standard full reports (max report rate for dash dancing / short hops)
-SET_INPUT_MODE = bytearray([0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x30])
+SET_INPUT_MODE = bytearray(build_input_mode())
 
 # Rumble command: 0x0A = vibration, 0x91, interface 0x00 (USB) or 0x01 (BLE)
 def build_rumble_cmd_usb(state: bool) -> bytes:
-    return bytes([0x0A, 0x91, 0x00, 0x02, 0x00, 0x04,
-                  0x00, 0x00, 0x01 if state else 0x00,
-                  0x00, 0x00, 0x00])
+    return build_rumble(state, "usb")
 
 def build_rumble_cmd_ble(state: bool) -> bytes:
-    return bytes([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
-                  0x00, 0x00, 0x01 if state else 0x00,
-                  0x00, 0x00, 0x00])
+    return build_rumble(state, "ble")
 
 
 class NSODriver:
@@ -313,13 +306,8 @@ class NSODriver:
             self.dsu_server = None
         
         # Calibration offsets (assume controller starts in neutral position)
-        self.calibration = {
-            'main_x_center': None,
-            'main_y_center': None,
-            'c_x_center': None,
-            'c_y_center': None,
-            'calibrated': False
-        }
+        self.calibration = CalibrationState()
+        self.input_parser = NSOReportParser()
         self._init_latency_monitor()
 
     def _init_latency_monitor(self):
@@ -434,14 +422,11 @@ class NSODriver:
         for _ in range(num_samples):
             try:
                 data = self.hid_device.read(64)
-                if data and len(data) >= 12:
-                    # Extract 12-bit values using nibble packing (same as parse_input)
-                    samples.append({
-                        'main_x': data[6] | ((data[7] & 0x0F) << 8),
-                        'main_y': (data[7] >> 4) | (data[8] << 4),
-                        'c_x': data[9] | ((data[10] & 0x0F) << 8),
-                        'c_y': (data[10] >> 4) | (data[11] << 4),
-                    })
+                if data:
+                    controller_state = self.parse_controller_state(data)
+                    sample = extract_calibration_sample(controller_state)
+                    if sample:
+                        samples.append(sample)
             except:
                 pass
         
@@ -449,12 +434,7 @@ class NSODriver:
             print("  ✗ Not enough samples for calibration")
             return False
         
-        # Calculate average (median might be better, but average is simpler)
-        self.calibration['main_x_center'] = int(sum(s['main_x'] for s in samples) / len(samples))
-        self.calibration['main_y_center'] = int(sum(s['main_y'] for s in samples) / len(samples))
-        self.calibration['c_x_center'] = int(sum(s['c_x'] for s in samples) / len(samples))
-        self.calibration['c_y_center'] = int(sum(s['c_y'] for s in samples) / len(samples))
-        self.calibration['calibrated'] = True
+        self.calibration.update_from_samples(samples, reducer='mean')
         
         print(f"  ✓ Calibration complete:")
         print(f"    Main stick center: X={self.calibration['main_x_center']}, Y={self.calibration['main_y_center']}")
@@ -462,155 +442,31 @@ class NSODriver:
         return True
     
     def parse_input(self, data, report_id_offset=0, ble_layout=False):
-        """Parse HID input data based on discovered format.
+        return self.input_parser.parse_usb_input(
+            data,
+            calibration=self.calibration,
+            report_id_offset=report_id_offset,
+            ble_layout=ble_layout,
+        )
 
-        report_id_offset: If BLE has a leading byte, pass 1 so indices shift.
-        ble_layout: If True, use Nintendo standard BLE report button bytes (3/4/5).
-                   If False, use USB/discovered format (unchanged).
-        """
-        o = report_id_offset
-        if len(data) < 12 + o:  # Need at least 12 bytes for sticks (bytes 6-11) after offset
-            return None
+    def parse_controller_state(self, data, report_id_offset=0, ble_layout=False):
+        return self.input_parser.parse_usb_controller_state(
+            data,
+            calibration=self.calibration,
+            report_id_offset=report_id_offset,
+            ble_layout=ble_layout,
+        )
 
-        if ble_layout:
-            # BLE only: Nintendo standard input report (dekuNukem bluetooth_hid_notes)
-            # Byte 3: Y, X, B, A, R, ZR  |  Byte 4: Minus, Plus, Home, Capture  |  Byte 5: Dpad, L, ZL
-            b3, b4, b5 = data[3 + o], data[4 + o], data[5 + o]
-            buttons = {
-                'Y': (b3 & 0x01) != 0,
-                'X': (b3 & 0x02) != 0,
-                'B': (b3 & 0x04) != 0,
-                'A': (b3 & 0x08) != 0,
-                'R': (b3 & 0x10) != 0,
-                'Z': (b3 & 0x20) != 0,
-                'Start': (b4 & 0x02) != 0,
-                'Dpad_Down': (b5 & 0x01) != 0,
-                'Dpad_Up': (b5 & 0x02) != 0,
-                'Dpad_Right': (b5 & 0x04) != 0,
-                'Dpad_Left': (b5 & 0x08) != 0,
-                'L': (b5 & 0x40) != 0,
-                'ZL': (b5 & 0x80) != 0,
-                'Home': (b4 & 0x10) != 0,
-                'Capture': (b4 & 0x20) != 0,
-            }
-        else:
-            # USB: original discovered format (do not change)
-            buttons = {
-                'B': (data[3 + o] & 0x01) != 0,
-                'A': (data[3 + o] & 0x02) != 0,
-                'Y': (data[3 + o] & 0x04) != 0,
-                'X': (data[3 + o] & 0x08) != 0,
-                'R': (data[3 + o] & 0x10) != 0,
-                'Z': (data[3 + o] & 0x20) != 0,
-                'Start': (data[3 + o] & 0x40) != 0,
-                'Dpad_Down': (data[4 + o] & 0x01) != 0,
-                'Dpad_Right': (data[4 + o] & 0x02) != 0,
-                'Dpad_Left': (data[4 + o] & 0x04) != 0,
-                'Dpad_Up': (data[4 + o] & 0x08) != 0,
-                'L': (data[4 + o] & 0x10) != 0,
-                'ZL': (data[4 + o] & 0x20) != 0,
-                'Home': (data[5 + o] & 0x01) != 0,
-                'Capture': (data[5 + o] & 0x02) != 0,
-            }
-
-        # Analog triggers (bytes 13 and 14) - restore original working positions
-        trigger_l = data[13 + o] if len(data) > 13 + o else 0
-        trigger_r = data[14 + o] if len(data) > 14 + o else 0
-
-        # Sticks - Switch HID protocol uses 12-bit nibble-packed values
-        # Each stick axis is 12 bits (0-4095), packed into 3 bytes per 2 axes
-        # Main stick: bytes 6-8 (X and Y packed)
-        # C-stick: bytes 9-11 (X and Y packed)
-        # Triggers: bytes 13-14 (working positions)
-        #
-        # 12-BIT NIBBLE PACKING FORMAT:
-        # Main Stick X: byte6 (low 8 bits) | (byte7 & 0x0F) << 8 (high 4 bits)
-        # Main Stick Y: (byte7 >> 4) (low 4 bits) | byte8 << 4 (high 8 bits)
-        # C-Stick X: byte9 (low 8 bits) | (byte10 & 0x0F) << 8 (high 4 bits)
-        # C-Stick Y: (byte10 >> 4) (low 4 bits) | byte11 << 4 (high 8 bits)
-        #
-        # MATH EXPLANATION:
-        # 1. Extract 12-bit values from nibble-packed bytes (0-4095)
-        # 2. Subtract calibration center (typically 2048 = 2^11) to get offset from neutral
-        # 3. Result is signed integer (-2048 to +2047), no wrapping needed
-
-        if len(data) >= 12 + o:
-            # STEP 1: Extract 12-bit values from nibble-packed bytes
-            # Main Stick (Left Stick) extraction
-            # Byte 6: Lower 8 bits of X
-            # Byte 7: Upper 4 bits of X (low nibble), Lower 4 bits of Y (high nibble)
-            # Byte 8: Upper 8 bits of Y
-            main_x_raw = data[6 + o] | ((data[7 + o] & 0x0F) << 8)
-            main_y_raw = (data[7 + o] >> 4) | (data[8 + o] << 4)
-
-            # C-Stick (Right Stick) extraction
-            # Byte 9: Lower 8 bits of X
-            # Byte 10: Upper 4 bits of X (low nibble), Lower 4 bits of Y (high nibble)
-            # Byte 11: Upper 8 bits of Y
-            c_x_raw = data[9 + o] | ((data[10 + o] & 0x0F) << 8)
-            c_y_raw = (data[10 + o] >> 4) | (data[11 + o] << 4)
-
-            # STEP 2: Apply calibration - subtract center to get offset from neutral
-            if self.calibration['calibrated']:
-                # Subtract measured center (12-bit value, typically around 2048)
-                main_x = main_x_raw - self.calibration['main_x_center']
-                main_y = main_y_raw - self.calibration['main_y_center']
-                c_x = c_x_raw - self.calibration['c_x_center']
-                c_y = c_y_raw - self.calibration['c_y_center']
-            else:
-                # Fallback: assume 2048 is center (2^11, middle of 12-bit range)
-                main_x = main_x_raw - 2048
-                main_y = main_y_raw - 2048
-                c_x = c_x_raw - 2048
-                c_y = c_y_raw - 2048
-
-            # STEP 3: Final output (no Y inversion needed - controller already outputs correct direction)
-            sticks = {
-                # Main stick: Use calibrated values directly
-                'main_x': main_x,
-                'main_y': main_y,  # No inversion needed
-
-                # C-stick: Use calibrated values directly
-                'c_x': c_x,
-                'c_y': c_y,  # No inversion needed
-
-                # Store raw 12-bit values for debugging
-                'main_x_raw': main_x_raw,
-                'main_y_raw': main_y_raw,
-                'c_x_raw': c_x_raw,
-                'c_y_raw': c_y_raw,
-
-                # Store calibrated offsets for debugging
-                'main_x_offset': main_x,
-                'main_y_offset': main_y,
-                'c_x_offset': c_x,
-                'c_y_offset': c_y,
-
-                # Raw bytes for debugging
-                'raw_bytes': {
-                    'main': [data[6 + o], data[7 + o], data[8 + o]],
-                    'c': [data[9 + o], data[10 + o], data[11 + o]],
-                },
-            }
-        else:
-            # Fallback
-            sticks = {
-                'main_x': 0, 'main_y': 0, 'c_x': 0, 'c_y': 0,
-            }
-
-        return {
-            'buttons': buttons,
-            'trigger_l': trigger_l,
-            'trigger_r': trigger_r,
-            'sticks': sticks,
-            'raw': data
-        }
-
-    def _stick_12bit_from_bytes(self, b0, b1, b2):
-        """Decode 12-bit nibble-packed stick axis from 3 bytes (Nintendo standard)."""
-        x_raw = b0 | ((b1 & 0x0F) << 8)
-        y_raw = (b1 >> 4) | (b2 << 4)
-        return x_raw, y_raw
+    def _update_dsu_state(self, controller_state: ControllerState):
+        if not (self.dsu_server and self.dsu_server.running):
+            return
+        try:
+            self.dsu_server.update(
+                controller_state,
+                pad_id=getattr(self, 'dsu_pad_id', 0),
+            )
+        except Exception:
+            pass
 
     def log_sample(self, data_list, parsed):
         """Log a sample to file with all interpretations."""
@@ -683,23 +539,12 @@ class NSODriver:
                     data_list = list(data)
                     
                     # Process all data for logging (even if unchanged)
-                    parsed = self.parse_input(data_list)
-                    if parsed:
+                    controller_state = self.parse_controller_state(data_list)
+                    if controller_state:
+                        parsed = controller_state.to_legacy_dict()
                         self.current_state = parsed
                         
-                        # Update DSU server if running - pass raw bytes for on-demand parsing
-                        if self.dsu_server and self.dsu_server.running:
-                            try:
-                                # Store raw bytes for on-demand parsing (reduces latency)
-                                raw_state = {'raw_bytes': data_list, 'parsed': parsed}
-                                self.dsu_server.update(
-                                    raw_state,
-                                    pad_id=getattr(self, 'dsu_pad_id', 0),
-                                    connection_type=getattr(self, 'dsu_connection_type', 0x01),
-                                )
-                            except Exception as e:
-                                # Silently ignore DSU errors (client may not be connected)
-                                pass
+                        self._update_dsu_state(controller_state)
                         
                         # Log sample if logging enabled (every second, regardless of changes)
                         if self.log_file:
@@ -856,6 +701,10 @@ class NSOWirelessDriver(NSODriver):
         self.address = mac_address
         self.report_id_offset = report_id_offset
         self.ble_report_layout = ble_report_layout  # 'auto' | 'standard' | 'reordered' | '0x3f'
+        self.ble_parser = NSOReportParser(
+            report_id_offset=report_id_offset,
+            ble_report_layout=ble_report_layout,
+        )
         self.ble_debug = ble_debug
         self.ble_discover = ble_discover
         self._ble_calibration_samples = []
@@ -888,116 +737,10 @@ class NSOWirelessDriver(NSODriver):
                 pass
 
     def parse_ble_input(self, data):
-        """Parse BLE input report. Handles Nintendo formats: 0x3F (simple), reordered (sticks then buttons), standard 0x30.
-        BLE differs from USB: report type in byte 0, sometimes different field order; bytes 13+ are IMU not triggers.
-        """
-        if len(data) < 12:
-            return None
-        report_id = data[0]
-        # BLE 0x30 uses bytes 13+ for IMU; we set triggers from L/ZL buttons after parsing
+        return self.ble_parser.parse_ble_input(data, calibration=self.calibration)
 
-        # --- INPUT 0x3F (simple report: buttons 1-2, stick hat 3, left stick 4-7 as 16-bit, right 8-11) ---
-        if report_id == 0x3F and (self.ble_report_layout in ('auto', '0x3f')):
-            # dekuNukem: Byte 1 = Down, Right, Left, Up, SL, SR; Byte 2 = Minus, Plus, LStick, RStick, Home, Capture, L, ZR
-            b1, b2 = data[1], data[2]
-            buttons = {
-                'Dpad_Down': (b1 & 0x01) != 0,
-                'Dpad_Right': (b1 & 0x02) != 0,
-                'Dpad_Left': (b1 & 0x04) != 0,
-                'Dpad_Up': (b1 & 0x08) != 0,
-                'Start': (b2 & 0x02) != 0,   # Plus
-                'Home': (b2 & 0x10) != 0,
-                'Capture': (b2 & 0x20) != 0,
-                'L': (b2 & 0x40) != 0,
-                'Z': (b2 & 0x80) != 0,
-                'Y': False, 'X': False, 'B': False, 'A': False, 'R': False, 'ZL': False,  # 0x3F may not expose these
-            }
-            # Sticks: 16-bit per axis (data[0]|(data[1]<<8), data[2]|(data[3]<<8))
-            main_x_raw = data[4] | (data[5] << 8)
-            main_y_raw = data[6] | (data[7] << 8)
-            c_x_raw = data[8] | (data[9] << 8)
-            c_y_raw = data[10] | (data[11] << 8)
-            center = 32768
-            main_x = main_x_raw - center
-            main_y = main_y_raw - center
-            c_x = c_x_raw - center
-            c_y = c_y_raw - center
-            sticks = {
-                'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-                'main_x_raw': main_x_raw, 'main_y_raw': main_y_raw, 'c_x_raw': c_x_raw, 'c_y_raw': c_y_raw,
-                'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-                'raw_bytes': {'main': data[4:8], 'c': data[8:12]},
-            }
-            trigger_l = 255 if buttons.get('L') else 0
-            trigger_r = 255 if buttons.get('Z') else 0
-            return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
-
-        # --- Reordered layout (sticks then buttons): left stick 3-5, right stick 6-8, buttons 9-11) ---
-        if self.ble_report_layout == 'standard':
-            pass  # fall through to standard block below
-        elif self.ble_report_layout in ('auto', 'reordered') and len(data) >= 12:
-            # Nintendo standard button bits on bytes 9,10,11
-            b3, b4, b5 = data[9], data[10], data[11]
-            buttons = {
-                'Y': (b3 & 0x01) != 0, 'X': (b3 & 0x02) != 0, 'B': (b3 & 0x04) != 0, 'A': (b3 & 0x08) != 0,
-                'R': (b3 & 0x10) != 0, 'Z': (b3 & 0x20) != 0,
-                'Start': (b4 & 0x02) != 0, 'Dpad_Down': (b5 & 0x01) != 0, 'Dpad_Up': (b5 & 0x02) != 0,
-                'Dpad_Right': (b5 & 0x04) != 0, 'Dpad_Left': (b5 & 0x08) != 0,
-                'L': (b5 & 0x40) != 0, 'ZL': (b5 & 0x80) != 0,
-                'Home': (b4 & 0x10) != 0, 'Capture': (b4 & 0x20) != 0,
-            }
-            main_x_raw, main_y_raw = self._stick_12bit_from_bytes(data[3], data[4], data[5])
-            c_x_raw, c_y_raw = self._stick_12bit_from_bytes(data[6], data[7], data[8])
-            if self.calibration['calibrated']:
-                main_x = main_x_raw - self.calibration['main_x_center']
-                main_y = main_y_raw - self.calibration['main_y_center']
-                c_x = c_x_raw - self.calibration['c_x_center']
-                c_y = c_y_raw - self.calibration['c_y_center']
-            else:
-                main_x, main_y = main_x_raw - 2048, main_y_raw - 2048
-                c_x, c_y = c_x_raw - 2048, c_y_raw - 2048
-            sticks = {
-                'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-                'main_x_raw': main_x_raw, 'main_y_raw': main_y_raw, 'c_x_raw': c_x_raw, 'c_y_raw': c_y_raw,
-                'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-                'raw_bytes': {'main': [data[3], data[4], data[5]], 'c': [data[6], data[7], data[8]]},
-            }
-            trigger_l = 255 if buttons.get('ZL') else 0
-            trigger_r = 255 if buttons.get('Z') else 0
-            return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
-
-        # --- Standard 0x30 layout: buttons 3-5, left stick 6-8, right stick 9-11 ---
-        o = self.report_id_offset
-        if len(data) < 12 + o:
-            return None
-        b3, b4, b5 = data[3 + o], data[4 + o], data[5 + o]
-        buttons = {
-            'Y': (b3 & 0x01) != 0, 'X': (b3 & 0x02) != 0, 'B': (b3 & 0x04) != 0, 'A': (b3 & 0x08) != 0,
-            'R': (b3 & 0x10) != 0, 'Z': (b3 & 0x20) != 0,
-            'Start': (b4 & 0x02) != 0, 'Dpad_Down': (b5 & 0x01) != 0, 'Dpad_Up': (b5 & 0x02) != 0,
-            'Dpad_Right': (b5 & 0x04) != 0, 'Dpad_Left': (b5 & 0x08) != 0,
-            'L': (b5 & 0x40) != 0, 'ZL': (b5 & 0x80) != 0,
-            'Home': (b4 & 0x10) != 0, 'Capture': (b4 & 0x20) != 0,
-        }
-        main_x_raw, main_y_raw = self._stick_12bit_from_bytes(data[6 + o], data[7 + o], data[8 + o])
-        c_x_raw, c_y_raw = self._stick_12bit_from_bytes(data[9 + o], data[10 + o], data[11 + o])
-        if self.calibration['calibrated']:
-            main_x = main_x_raw - self.calibration['main_x_center']
-            main_y = main_y_raw - self.calibration['main_y_center']
-            c_x = c_x_raw - self.calibration['c_x_center']
-            c_y = c_y_raw - self.calibration['c_y_center']
-        else:
-            main_x, main_y = main_x_raw - 2048, main_y_raw - 2048
-            c_x, c_y = c_x_raw - 2048, c_y_raw - 2048
-        sticks = {
-            'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-            'main_x_raw': main_x_raw, 'main_y_raw': main_y_raw, 'c_x_raw': c_x_raw, 'c_y_raw': c_y_raw,
-            'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-            'raw_bytes': {'main': [data[6 + o], data[7 + o], data[8 + o]], 'c': [data[9 + o], data[10 + o], data[11 + o]]},
-        }
-        trigger_l = 255 if buttons.get('ZL') else 0
-        trigger_r = 255 if buttons.get('Z') else 0
-        return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
+    def parse_ble_controller_state(self, data):
+        return self.ble_parser.parse_ble_controller_state(data, calibration=self.calibration)
 
     def read_loop(self):
         """No-op for BLE: data comes via notifications. Keeps GUI/thread layout unchanged."""
@@ -1005,149 +748,16 @@ class NSOWirelessDriver(NSODriver):
             time.sleep(0.1)
 
     def _parse_ble_nso(self, data):
-        """
-        NSO BLE Parser. Detects layout from RAW: macOS often strips Report ID so we get
-        [timer, battery, btn, btn, btn, left_stick_3, right_stick_3, ...] -> buttons 2,3,4; sticks 5-7, 8-10.
-        If byte 0 == 0x30 then full report: buttons 3,4,5; sticks 6-8, 9-11.
-        """
-        if len(data) < 11:
-            return None
-        # Stripped report (byte 0 = timer 0-15): buttons at 2,3,4; left stick 5,6,7; right stick 8,9,10
-        if data[0] != 0x30:
-            if len(data) < 11:
-                return None
-            b3, b4, b5 = data[2], data[3], data[4]
-            lx_raw = data[5] | ((data[6] & 0x0F) << 8)
-            ly_raw = (data[6] >> 4) | (data[7] << 4)
-            rx_raw = data[8] | ((data[9] & 0x0F) << 8)
-            ry_raw = (data[9] >> 4) | (data[10] << 4)
-            stick_bytes = {'main': [data[5], data[6], data[7]], 'c': [data[8], data[9], data[10]]}
-            trigger_l = data[13] if len(data) > 13 else 0
-            trigger_r = data[14] if len(data) > 14 else 0
-        else:
-            # Full report (byte 0 = 0x30): buttons 3,4,5; left stick 6,7,8; right stick 9,10,11
-            if len(data) < 12:
-                return None
-            b3, b4, b5 = data[3], data[4], data[5]
-            lx_raw = data[6] | ((data[7] & 0x0F) << 8)
-            ly_raw = (data[7] >> 4) | (data[8] << 4)
-            rx_raw = data[9] | ((data[10] & 0x0F) << 8)
-            ry_raw = (data[10] >> 4) | (data[11] << 4)
-            stick_bytes = {'main': [data[6], data[7], data[8]], 'c': [data[9], data[10], data[11]]}
-            trigger_l = data[14] if len(data) > 14 else 0
-            trigger_r = data[15] if len(data) > 15 else 0
-        # Nintendo standard button bits: byte 3 = Y,X,B,A,R,ZR; byte 4 = Minus,Plus,Home,Capture; byte 5 = Dpad,L,ZL
-        buttons = {
-            'Y': (b3 & 0x01) != 0, 'X': (b3 & 0x02) != 0, 'B': (b3 & 0x04) != 0, 'A': (b3 & 0x08) != 0,
-            'R': (b3 & 0x10) != 0, 'Z': (b3 & 0x20) != 0,
-            'Start': (b4 & 0x02) != 0, 'Home': (b4 & 0x10) != 0, 'Capture': (b4 & 0x20) != 0,
-            'Dpad_Down': (b5 & 0x01) != 0, 'Dpad_Up': (b5 & 0x02) != 0,
-            'Dpad_Right': (b5 & 0x04) != 0, 'Dpad_Left': (b5 & 0x08) != 0,
-            'L': (b5 & 0x40) != 0, 'ZL': (b5 & 0x80) != 0,
-        }
-        if self.calibration['calibrated']:
-            main_x = lx_raw - self.calibration['main_x_center']
-            main_y = ly_raw - self.calibration['main_y_center']
-            c_x = rx_raw - self.calibration['c_x_center']
-            c_y = ry_raw - self.calibration['c_y_center']
-        else:
-            main_x = lx_raw - 2048
-            main_y = ly_raw - 2048
-            c_x = rx_raw - 2048
-            c_y = ry_raw - 2048
-        sticks = {
-            'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-            'main_x_raw': lx_raw, 'main_y_raw': ly_raw, 'c_x_raw': rx_raw, 'c_y_raw': ry_raw,
-            'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-            'raw_bytes': stick_bytes,
-        }
-        if trigger_l == 0 and trigger_r == 0:
-            trigger_l = 255 if buttons.get('ZL') else 0
-            trigger_r = 255 if buttons.get('Z') else 0
-        return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
+        controller_state = self.ble_parser._parse_ble_nso(data, calibration=self.calibration)
+        return controller_state.to_legacy_dict() if controller_state else None
 
     def _parse_ble_63_discovered(self, data):
-        """Parse 63-byte BLE report from --ble-discover mapping.
-        Buttons: byte2 (B,A,Y,X,R,Z,Start), byte3 (Dpad_Down,Right,Left,Up,L,ZL), byte4 (Home,Capture).
-        Sticks: main 5-7 (12-bit nibble packed), c-stick 8-10. Triggers: 12,13 or digital from ZL/Z.
-        """
-        if len(data) < 11:
-            return None
-        b2, b3, b4 = data[2], data[3], data[4]
-        buttons = {
-            'B': (b2 & 0x01) != 0, 'A': (b2 & 0x02) != 0, 'Y': (b2 & 0x04) != 0, 'X': (b2 & 0x08) != 0,
-            'R': (b2 & 0x10) != 0, 'Z': (b2 & 0x20) != 0, 'Start': (b2 & 0x40) != 0,
-            'Dpad_Down': (b3 & 0x01) != 0, 'Dpad_Right': (b3 & 0x02) != 0, 'Dpad_Left': (b3 & 0x04) != 0,
-            'Dpad_Up': (b3 & 0x08) != 0, 'L': (b3 & 0x10) != 0, 'ZL': (b3 & 0x20) != 0,
-            'Home': (b4 & 0x01) != 0, 'Capture': (b4 & 0x02) != 0,
-        }
-        main_x_raw = data[5] | ((data[6] & 0x0F) << 8)
-        main_y_raw = (data[6] >> 4) | (data[7] << 4)
-        c_x_raw = data[8] | ((data[9] & 0x0F) << 8)
-        c_y_raw = (data[9] >> 4) | (data[10] << 4)
-        if self.calibration['calibrated']:
-            main_x = main_x_raw - self.calibration['main_x_center']
-            main_y = main_y_raw - self.calibration['main_y_center']
-            c_x = c_x_raw - self.calibration['c_x_center']
-            c_y = c_y_raw - self.calibration['c_y_center']
-        else:
-            main_x = main_x_raw - 2048
-            main_y = main_y_raw - 2048
-            c_x = c_x_raw - 2048
-            c_y = c_y_raw - 2048
-        sticks = {
-            'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-            'main_x_raw': main_x_raw, 'main_y_raw': main_y_raw, 'c_x_raw': c_x_raw, 'c_y_raw': c_y_raw,
-            'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-            'raw_bytes': {'main': [data[5], data[6], data[7]], 'c': [data[8], data[9], data[10]]},
-        }
-        trigger_l = data[12] if len(data) > 12 else 0
-        trigger_r = data[13] if len(data) > 13 else 0
-        if trigger_l == 0 and trigger_r == 0:
-            trigger_l = 255 if buttons.get('ZL') else 0
-            trigger_r = 255 if buttons.get('Z') else 0
-        return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
+        controller_state = self.ble_parser._parse_ble_63_discovered(data, calibration=self.calibration)
+        return controller_state.to_legacy_dict() if controller_state else None
 
     def _parse_ble_blueretro(self, data):
-        """Parse BLE input using BlueRetro SW2 GC layout (main/adapter/wireless/sw2.c struct sw2_map).
-        Layout: bytes 0-3 tbd, 4-7 buttons (uint32 LE), 8-9 tbd, 10-15 axes[6] (left 10-12, right 13-15), 16-59 tbd, 60-61 triggers.
-        Button bits (sw2_gc_btns_mask): 8=L, 9=R, 10=D, 11=U, 16=B, 17=X, 18=A, 19=Y, 20=Plus, 21=C, 22=Home, 23=Capture, 25=ZL, 26=L, 29=ZR, 30=R.
-        """
-        if len(data) < 62:
-            return None
-        buttons_u32 = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24)
-        def bit(b): return (buttons_u32 >> b) & 1
-        buttons = {
-            'Dpad_Left': bit(8), 'Dpad_Right': bit(9), 'Dpad_Down': bit(10), 'Dpad_Up': bit(11),
-            'B': bit(16), 'X': bit(17), 'A': bit(18), 'Y': bit(19),
-            'Start': bit(20),  # Plus
-            'Home': bit(22), 'Capture': bit(23),
-            'ZL': bit(25), 'L': bit(26), 'Z': bit(29), 'R': bit(30),
-        }
-        # Sticks: bytes 10-12 (left), 13-15 (right), same 12-bit nibble packing
-        main_x_raw = data[10] | ((data[11] & 0x0F) << 8)
-        main_y_raw = (data[11] >> 4) | (data[12] << 4)
-        c_x_raw = data[13] | ((data[14] & 0x0F) << 8)
-        c_y_raw = (data[14] >> 4) | (data[15] << 4)
-        if self.calibration['calibrated']:
-            main_x = main_x_raw - self.calibration['main_x_center']
-            main_y = main_y_raw - self.calibration['main_y_center']
-            c_x = c_x_raw - self.calibration['c_x_center']
-            c_y = c_y_raw - self.calibration['c_y_center']
-        else:
-            main_x = main_x_raw - 2048
-            main_y = main_y_raw - 2048
-            c_x = c_x_raw - 2048
-            c_y = c_y_raw - 2048
-        sticks = {
-            'main_x': main_x, 'main_y': main_y, 'c_x': c_x, 'c_y': c_y,
-            'main_x_raw': main_x_raw, 'main_y_raw': main_y_raw, 'c_x_raw': c_x_raw, 'c_y_raw': c_y_raw,
-            'main_x_offset': main_x, 'main_y_offset': main_y, 'c_x_offset': c_x, 'c_y_offset': c_y,
-            'raw_bytes': {'main': [data[10], data[11], data[12]], 'c': [data[13], data[14], data[15]]},
-        }
-        trigger_l = data[60] if len(data) > 60 else 0
-        trigger_r = data[61] if len(data) > 61 else 0
-        return {'buttons': buttons, 'trigger_l': trigger_l, 'trigger_r': trigger_r, 'sticks': sticks, 'raw': data}
+        controller_state = self.ble_parser._parse_ble_blueretro(data, calibration=self.calibration)
+        return controller_state.to_legacy_dict() if controller_state else None
 
     def _notification_handler(self, sender, data):
         """Handle BLE input report notifications. Native NSO (sliding-window) first; 63-byte = BlueRetro layout."""
@@ -1167,58 +777,35 @@ class NSOWirelessDriver(NSODriver):
                 print(f"RAW: {list(data_list[:16])}")
                 if self._ble_raw_count == 1:
                     print("  (Neutral note; Hold A -> which index changed? Hold Stick Left -> which 2-3 indices? That gives button byte and stick block.)")
-        # 63-byte report = discovered layout (buttons 2,3,4; sticks 5-7, 8-10); 62-byte = BlueRetro; else NSO
-        if len(data_list) == 63:
-            parsed = self._parse_ble_63_discovered(data_list)
-        elif len(data_list) >= 62:
-            parsed = self._parse_ble_blueretro(data_list)
-        else:
-            parsed = self._parse_ble_nso(data_list)
-        if not parsed:
-            parsed = self.parse_input(data_list, report_id_offset=self.report_id_offset, ble_layout=False)
-        if not parsed:
+        controller_state = self.ble_parser.parse_ble_notification_controller_state(
+            data_list,
+            calibration=self.calibration,
+        )
+        if not controller_state:
             return
+        parsed = controller_state.to_legacy_dict()
 
         # Deferred calibration from parsed stick raw values (median over 50 samples, skip first few reports).
         # Run median computation in a background thread so the notification callback returns immediately.
-        if not self.calibration['calibrated'] and 'sticks' in parsed and 'main_x_raw' in parsed['sticks']:
+        sample = extract_calibration_sample(controller_state)
+        if not self.calibration['calibrated'] and sample:
             if getattr(self, '_ble_calibration_skip', 0) > 0:
                 self._ble_calibration_skip -= 1
             else:
-                s = parsed['sticks']
-                self._ble_calibration_samples.append({
-                    'main_x': s['main_x_raw'], 'main_y': s['main_y_raw'],
-                    'c_x': s['c_x_raw'], 'c_y': s['c_y_raw'],
-                })
+                self._ble_calibration_samples.append(sample)
                 if len(self._ble_calibration_samples) >= 50:
                     samples = list(self._ble_calibration_samples)
                     self._ble_calibration_samples.clear()
 
                     def _apply_calibration():
-                        def median(vals):
-                            srt = sorted(vals)
-                            return srt[len(srt) // 2]
-                        self.calibration['main_x_center'] = median(s['main_x'] for s in samples)
-                        self.calibration['main_y_center'] = median(s['main_y'] for s in samples)
-                        self.calibration['c_x_center'] = median(s['c_x'] for s in samples)
-                        self.calibration['c_y_center'] = median(s['c_y'] for s in samples)
-                        self.calibration['calibrated'] = True
+                        self.calibration.update_from_samples(samples, reducer='median')
                         print("  ✓ BLE stick calibration complete (median of 50 samples)")
 
                     threading.Thread(target=_apply_calibration, daemon=True).start()
 
         self.current_state = parsed
 
-        if self.dsu_server and self.dsu_server.running:
-            try:
-                raw_state = {'raw_bytes': data_list, 'parsed': parsed}
-                self.dsu_server.update(
-                    raw_state,
-                    pad_id=getattr(self, 'dsu_pad_id', 0),
-                    connection_type=getattr(self, 'dsu_connection_type', 0x02),
-                )
-            except Exception:
-                pass
+        self._update_dsu_state(controller_state)
 
         if self.log_file:
             try:

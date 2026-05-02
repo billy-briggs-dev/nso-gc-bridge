@@ -12,7 +12,9 @@ import zlib
 import time
 import threading
 import subprocess
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, Mapping, Optional, Set
+
+from core import ControllerState
 
 
 def send_test_rumble(port: int = 26760, slot: int = 0, duration_ms: int = 500) -> bool:
@@ -99,7 +101,8 @@ class DSUServer:
         self.running = False
         self.packet_counter = 0
         # Multi-slot: state and button latch per pad (0-3)
-        self.last_state_by_slot: Dict[int, Dict] = {}
+        self.last_state_by_slot: Dict[int, object] = {}
+        self.connection_type_by_slot: Dict[int, int] = {}
         self.pending_presses_by_slot: Dict[int, Set[str]] = {}
         self.thread = None
         self._logged_clients = set()
@@ -220,9 +223,10 @@ class DSUServer:
         
         return bytes(packet)
     
-    def _create_pad_data_packet(self, state: Dict, pad_id: int = 0, connection_type: int = 0x01) -> bytes:
+    def _create_pad_data_packet(self, state, pad_id: int = 0, connection_type: int = 0x01) -> bytes:
         """
-        Create a DSU pad data packet. Parses on-demand from raw bytes for minimum latency.
+        Create a DSU pad data packet from canonical controller state.
+        Legacy dict payloads are still accepted for compatibility.
         connection_type: 0x01=USB, 0x02=Bluetooth
 
         Packet format (100 bytes total):
@@ -243,23 +247,11 @@ class DSUServer:
         - Triggers: bytes 54-55
         - Rest: padding/IMU data
         """
-        # Parse on-demand from raw bytes if available (faster - parse only when sending)
-        if 'raw_bytes' in state and 'parsed' in state:
-            # Use pre-parsed data if available (fallback)
-            parsed = state.get('parsed', {})
-        else:
-            # Legacy mode: use already parsed state
-            parsed = state
-        
-        # Get buttons and apply state latch - force pending presses to True
-        buttons = parsed.get('buttons', {}).copy()  # Copy to avoid modifying original
+        buttons, sticks, trigger_l, trigger_r = self._extract_controller_fields(state)
+        buttons = buttons.copy()
         pending = self.pending_presses_by_slot.get(pad_id, set())
         for btn in list(pending):
             buttons[btn] = True
-        
-        sticks = parsed.get('sticks', {})
-        trigger_l = parsed.get('trigger_l', 0)
-        trigger_r = parsed.get('trigger_r', 0)
         
         # Use pre-allocated buffer to avoid GC pressure
         packet = self._pad_data_buffer
@@ -491,38 +483,78 @@ class DSUServer:
             pass  # Silently ignore pad info errors
     
     def _get_connection_type_for_slot(self, slot_id: int) -> int:
-        """Return 0x01=USB or 0x02=BLE for slot. Stored in state as 'connection_type' or default USB."""
+        """Return 0x01=USB or 0x02=BLE for slot."""
+        if slot_id in self.connection_type_by_slot:
+            return self.connection_type_by_slot[slot_id]
         state = self.last_state_by_slot.get(slot_id)
-        if state and isinstance(state.get('connection_type'), int):
-            return state['connection_type']
+        inferred = self._infer_connection_type(state)
+        if inferred is not None:
+            return inferred
         return 0x01
     
-    def update(self, state: Dict, pad_id: int = 0, connection_type: int = 0x01):
+    def _infer_connection_type(self, state) -> Optional[int]:
+        if isinstance(state, ControllerState) and state.transport is not None:
+            if state.transport.transport.lower() == 'ble':
+                return 0x02
+            return 0x01
+        if isinstance(state, Mapping):
+            if isinstance(state.get('connection_type'), int):
+                return state['connection_type']
+            nested_state = state.get('controller_state')
+            if isinstance(nested_state, ControllerState) and nested_state.transport is not None:
+                if nested_state.transport.transport.lower() == 'ble':
+                    return 0x02
+                return 0x01
+        return None
+
+    def _extract_controller_fields(self, state):
+        if isinstance(state, ControllerState):
+            return (
+                dict(state.buttons),
+                state.sticks.to_legacy_dict(),
+                state.trigger_l,
+                state.trigger_r,
+            )
+        if isinstance(state, Mapping):
+            nested_state = state.get('controller_state')
+            if isinstance(nested_state, ControllerState):
+                return (
+                    dict(nested_state.buttons),
+                    nested_state.sticks.to_legacy_dict(),
+                    nested_state.trigger_l,
+                    nested_state.trigger_r,
+                )
+            parsed = state.get('parsed', state)
+            return (
+                dict(parsed.get('buttons', {})),
+                parsed.get('sticks', {}),
+                parsed.get('trigger_l', 0),
+                parsed.get('trigger_r', 0),
+            )
+        return ({}, {}, 0, 0)
+
+    def update(self, state, pad_id: int = 0, connection_type: Optional[int] = None):
         """
         Update controller state for a slot (stored for responding to client requests).
         Tracks button presses in a latch to ensure quick taps aren't dropped.
         
         Args:
-            state: Dictionary containing buttons, sticks, triggers
+            state: ControllerState or legacy mapping containing buttons, sticks, triggers
             pad_id: DSU slot (0-3) this controller maps to
-            connection_type: 0x01=USB, 0x02=Bluetooth (for pad info display)
+            connection_type: 0x01=USB, 0x02=Bluetooth (optional; inferred from canonical state when omitted)
         """
-        # Store connection type in state for pad info responses
-        state_with_meta = dict(state)
-        state_with_meta['connection_type'] = connection_type
-        
         # Check for new presses and add them to the latch
-        if 'parsed' in state:
-            btns = state['parsed'].get('buttons', {})
-        else:
-            btns = state.get('buttons', {})
+        btns, _, _, _ = self._extract_controller_fields(state)
         
         pending = self.pending_presses_by_slot.setdefault(pad_id, set())
         for btn, pressed in btns.items():
             if pressed:
                 pending.add(btn)
         
-        self.last_state_by_slot[pad_id] = state_with_meta
+        self.last_state_by_slot[pad_id] = state
+        self.connection_type_by_slot[pad_id] = (
+            connection_type if connection_type is not None else self._infer_connection_type(state) or 0x01
+        )
     
     def register_rumble_callback(self, pad_id: int, callback: Callable[[int, int], None]):
         """Register a rumble callback for a pad. Called when Dolphin sends rumble (0x110002)."""

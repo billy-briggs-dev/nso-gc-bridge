@@ -1,0 +1,63 @@
+{
+  "description": "BLE 0x30 example with buttons, digital trigger fallback, and non-neutral sticks.",
+  "parser": "NSOWirelessDriver.parse_ble_input (ble_report_layout=standard)",
+  "raw_report": [
+    48,
+    0,
+    0,
+    56,
+    18,
+    136,
+    0,
+    12,
+    64,
+    0,
+    10,
+    96,
+    0,
+    0,
+    0,
+    0
+  ],
+  "raw_report_hex": "30 00 00 38 12 88 00 0c 40 00 0a 60 00 00 00 00",
+  "expected": {
+    "pressed_buttons": [
+      "A",
+      "R",
+      "Z",
+      "ZL",
+      "Start",
+      "Home",
+      "Dpad_Left"
+    ],
+    "buttons": {
+      "A": true,
+      "B": false,
+      "X": false,
+      "Y": false,
+      "L": false,
+      "R": true,
+      "Z": true,
+      "ZL": true,
+      "Start": true,
+      "Home": true,
+      "Capture": false,
+      "Dpad_Up": false,
+      "Dpad_Down": false,
+      "Dpad_Left": true,
+      "Dpad_Right": false
+    },
+    "trigger_l": 255,
+    "trigger_r": 255,
+    "sticks": {
+      "main_x": 1024,
+      "main_y": -1024,
+      "c_x": 512,
+      "c_y": -512,
+      "main_x_raw": 3072,
+      "main_y_raw": 1024,
+      "c_x_raw": 2560,
+      "c_y_raw": 1536
+    }
+  }
+}
