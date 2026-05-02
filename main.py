@@ -20,24 +20,25 @@ from collections import deque
 
 _USB_BACKEND = None
 _USB_BACKEND_INITIALIZED = False
+_USB_BACKEND_LOCK = threading.Lock()
 
 
-def _libusb_candidate_names(candidate):
+def _libusb_candidate_names(library_name):
     names = {
         "libusb-1.0.0.dylib",
         "libusb-1.0.dylib",
         "libusb-1.0.so.0",
         "libusb-1.0.so",
-        candidate,
-        f"{candidate}.dylib",
-        f"{candidate}.so",
-        f"{candidate}.so.0",
+        library_name,
+        f"{library_name}.dylib",
+        f"{library_name}.so",
+        f"{library_name}.so.0",
     }
-    if not candidate.startswith("lib"):
+    if not library_name.startswith("lib"):
         names.update({
-            f"lib{candidate}.dylib",
-            f"lib{candidate}.so",
-            f"lib{candidate}.so.0",
+            f"lib{library_name}.dylib",
+            f"lib{library_name}.so",
+            f"lib{library_name}.so.0",
         })
     return names
 
@@ -66,20 +67,22 @@ def _get_bundle_libusb_candidates(candidate_names=None):
     return candidates
 
 
-def _find_libusb_library(candidate):
-    candidate_names = _libusb_candidate_names(candidate)
+def _find_libusb_library(library_name):
+    candidate_names = _libusb_candidate_names(library_name)
     bundled_candidates = _get_bundle_libusb_candidates(candidate_names)
     if bundled_candidates:
         return bundled_candidates[0]
 
-    return ctypes.util.find_library(candidate)
+    return ctypes.util.find_library(library_name)
 
 
 def get_usb_backend():
     global _USB_BACKEND, _USB_BACKEND_INITIALIZED
     if not _USB_BACKEND_INITIALIZED:
-        _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
-        _USB_BACKEND_INITIALIZED = True
+        with _USB_BACKEND_LOCK:
+            if not _USB_BACKEND_INITIALIZED:
+                _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
+                _USB_BACKEND_INITIALIZED = True
     return _USB_BACKEND
 
 # Optional BLE support (for wireless controller not visible as HID)
