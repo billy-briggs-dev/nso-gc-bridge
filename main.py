@@ -24,22 +24,16 @@ _USB_BACKEND_LOCK = threading.Lock()
 
 
 def _libusb_candidate_names(library_name):
-    names = {
-        "libusb-1.0.0.dylib",
-        "libusb-1.0.dylib",
-        "libusb-1.0.so.0",
-        "libusb-1.0.so",
-        library_name,
-        f"{library_name}.dylib",
-        f"{library_name}.so",
-        f"{library_name}.so.0",
-    }
-    if not library_name.startswith("lib"):
-        names.update({
-            f"lib{library_name}.dylib",
-            f"lib{library_name}.so",
-            f"lib{library_name}.so.0",
-        })
+    names = set()
+    base_names = {library_name, "usb-1.0", "libusb-1.0"}
+    for base_name in tuple(base_names):
+        if not base_name.startswith("lib"):
+            base_names.add(f"lib{base_name}")
+
+    for base_name in base_names:
+        names.add(base_name)
+        for suffix in (".dylib", ".0.dylib", ".so", ".so.0"):
+            names.add(f"{base_name}{suffix}")
     return names
 
 
