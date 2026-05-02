@@ -42,9 +42,16 @@ def _libusb_candidate_names(candidate):
     return names
 
 
-def _get_bundle_libusb_candidates():
+def _get_bundle_libusb_candidates(candidate_names=None):
     if not getattr(sys, "frozen", False):
         return []
+    if candidate_names is None:
+        candidate_names = {
+            "libusb-1.0.0.dylib",
+            "libusb-1.0.dylib",
+            "libusb-1.0.so.0",
+            "libusb-1.0.so",
+        }
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     bundle_dir = os.path.normpath(os.path.join(exe_dir, ".."))
     candidates = []
@@ -52,12 +59,7 @@ def _get_bundle_libusb_candidates():
         os.path.join(bundle_dir, "Frameworks"),
         os.path.join(bundle_dir, "Resources"),
     ):
-        for name in (
-            "libusb-1.0.0.dylib",
-            "libusb-1.0.dylib",
-            "libusb-1.0.so.0",
-            "libusb-1.0.so",
-        ):
+        for name in candidate_names:
             path = os.path.join(base_dir, name)
             if os.path.isfile(path):
                 candidates.append(path)
@@ -66,9 +68,9 @@ def _get_bundle_libusb_candidates():
 
 def _find_libusb_library(candidate):
     candidate_names = _libusb_candidate_names(candidate)
-    for path in _get_bundle_libusb_candidates():
-        if os.path.basename(path) in candidate_names:
-            return path
+    bundled_candidates = _get_bundle_libusb_candidates(candidate_names)
+    if bundled_candidates:
+        return bundled_candidates[0]
 
     return ctypes.util.find_library(candidate)
 
