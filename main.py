@@ -60,6 +60,7 @@ def _get_bundle_libusb_candidates(candidate_names=None):
 
 
 def _find_libusb_library(library_name):
+    """Resolve libusb, preferring a readable bundled copy in frozen app builds."""
     candidate_names = _libusb_candidate_names(library_name)
     bundled_candidates = _get_bundle_libusb_candidates(candidate_names)
     if bundled_candidates:
@@ -69,6 +70,7 @@ def _find_libusb_library(library_name):
 
 
 def get_usb_backend():
+    """Return the cached libusb backend used for USB controller discovery."""
     global _USB_BACKEND, _USB_BACKEND_INITIALIZED
     with _USB_BACKEND_LOCK:
         if not _USB_BACKEND_INITIALIZED:
