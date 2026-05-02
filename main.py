@@ -78,12 +78,11 @@ def _find_libusb_library(library_name):
 
 def get_usb_backend():
     global _USB_BACKEND, _USB_BACKEND_INITIALIZED
-    if not _USB_BACKEND_INITIALIZED:
-        with _USB_BACKEND_LOCK:
-            if not _USB_BACKEND_INITIALIZED:
-                _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
-                _USB_BACKEND_INITIALIZED = True
-    return _USB_BACKEND
+    with _USB_BACKEND_LOCK:
+        if not _USB_BACKEND_INITIALIZED:
+            _USB_BACKEND = usb.backend.libusb1.get_backend(find_library=_find_libusb_library)
+            _USB_BACKEND_INITIALIZED = True
+        return _USB_BACKEND
 
 # Optional BLE support (for wireless controller not visible as HID)
 try:
